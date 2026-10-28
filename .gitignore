@@ -1,0 +1,52 @@
+# Notification data and local machine configuration
+/runtime/
+/local/
+/.env
+/.env.*
+!/.env.example
+*.local.sh
+*.local.toml
+*.local.json
+
+# Python artifacts and interrupted test runs
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.venv/
+venv/
+/tests/tmp-*/
+
+# Logs and transient state
+*.log
+*.pid
+*.sock
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db
+*.db-wal
+*.db-shm
+
+# Editor backups and OS metadata
+.DS_Store
+._*
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.bak
+
+# Credentials should never be part of this repository
+/.ssh/
+/credentials/
+/secrets/
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
