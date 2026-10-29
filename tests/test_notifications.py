@@ -17,6 +17,9 @@ from pathlib import Path
 
 sys.dont_write_bytecode = True
 PROJECT = Path(__file__).resolve().parent.parent
+TMP = PROJECT.parents[1] / "tmp"
+TMP.mkdir(exist_ok=True)
+os.environ.update(TMPDIR=str(TMP), TMP=str(TMP), TEMP=str(TMP))
 spec = importlib.util.spec_from_file_location("notify_queue", PROJECT / "server/notify_queue.py")
 queue_module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(queue_module)
@@ -36,7 +39,7 @@ def event(turn="turn-1", thread="thread-1"):
 
 class NotificationsTest(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="tmp-", dir=PROJECT / "tests")
+        self.temp = tempfile.TemporaryDirectory(prefix="notification-test-", dir=TMP)
         self.root = Path(self.temp.name)
         self.app = self.root / "tcodex-notification"
         shutil.copytree(PROJECT / "server", self.app / "server")
@@ -85,6 +88,25 @@ class NotificationsTest(unittest.TestCase):
         queue.close()
         with self.assertRaises(ValueError):
             self.queue("../../escape")
+
+    def test_watcher_state_is_isolated_from_notification_channels(self):
+        watcher_runtime = self.runtime / ".auto-continue"
+        self.runtime.mkdir(mode=0o700)
+        watcher_runtime.mkdir(mode=0o700)
+        checkpoint = watcher_runtime / "checkpoint.json"
+        checkpoint.write_text('{"offset": 123, "attempts": 2}\n')
+        before = checkpoint.read_bytes()
+        queue = self.queue()
+        try:
+            self.assertTrue(queue.enqueue(event()))
+            queue.prune()
+            self.assertEqual(len(queue.read_after(0)), 1)
+        finally:
+            queue.close()
+        self.assertEqual(checkpoint.read_bytes(), before)
+        with self.assertRaises(ValueError):
+            self.queue(".auto-continue")
+        self.assertEqual(checkpoint.read_bytes(), before)
 
     def test_retention_cap_and_monotonic_cursor(self):
         queue = self.queue()
