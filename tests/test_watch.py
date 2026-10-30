@@ -250,7 +250,7 @@ class WatchTests(unittest.TestCase):
         self.assertEqual(args.tmp_dir, TMP)
         self.assertEqual(TMP.relative_to(PROJECT.parents[1]), Path("tmp"))
         self.assertEqual((args.initial_delay, args.max_delay, args.max_retries),
-                         (60, 300, 5))
+                         (3, 3, 5))
         explicit = watch.parser().parse_args([
             "--thread", self.thread, "--runtime-dir", str(self.root / "custom"),
         ])
@@ -324,6 +324,25 @@ class WatchTests(unittest.TestCase):
         self.guards.history = history
         self.session.step(1060)
         self.assertFalse(self.sent)
+
+    def test_default_fixed_delay_and_retry_cap(self):
+        args = watch.parser().parse_args(["--all-cli"])
+        self.args.initial_delay = args.initial_delay
+        self.args.max_delay = args.max_delay
+        now = 1000
+        self.schedule(now=now)
+        for attempt in range(1, 6):
+            self.assertEqual(self.session.data["job"]["due"], now + 3)
+            self.session.step(now + 2)
+            self.assertEqual(len(self.sent), attempt - 1)
+            now += 3
+            self.session.step(now)
+            self.assertEqual(len(self.sent), attempt)
+            turn = uid()
+            self.append(event("task_started", turn), failure(turn))
+            self.session.step(now)
+        self.assertEqual(self.session.data["disabled"], "retry cap reached")
+        self.assertIsNone(self.session.data["job"])
 
     def test_backoff_cap_and_success_reset(self):
         now = 1000

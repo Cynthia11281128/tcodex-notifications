@@ -573,8 +573,8 @@ def parser():
     result.add_argument("--runtime-dir", type=Path,
                         default=PROJECT / "runtime/.auto-continue")
     result.add_argument("--tmp-dir", type=Path, default=DEFAULT_TMP)
-    result.add_argument("--initial-delay", type=positive_number, default=60)
-    result.add_argument("--max-delay", type=positive_number, default=300)
+    result.add_argument("--initial-delay", type=positive_number, default=3)
+    result.add_argument("--max-delay", type=positive_number, default=3)
     result.add_argument("--max-retries", type=positive_int, default=5)
     result.add_argument("--poll-interval", type=positive_number, default=1)
     result.add_argument("--discover-interval", type=positive_number, default=10)

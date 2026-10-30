@@ -190,8 +190,8 @@ tmux new-session -s tcodex-auto-continue \
 
 | 参数 | 默认值 | 含义 |
 | --- | --- | --- |
-| `--initial-delay` | 60 秒 | 第一次自动继续前的等待时间 |
-| `--max-delay` | 300 秒 | 退避上限 |
+| `--initial-delay` | 3 秒 | 第一次自动继续前的等待时间 |
+| `--max-delay` | 3 秒 | 等待时间上限，默认固定等待 |
 | `--max-retries` | 5 | 连续自动继续次数上限 |
 | `--poll-interval` | 1 秒 | 增量读取文件间隔 |
 | `--discover-interval` | 10 秒 | 新会话发现与活跃清单刷新间隔 |
@@ -202,7 +202,8 @@ tmux new-session -s tcodex-auto-continue \
 | `--dry-run` | 关闭 | 观察新失败，不提交消息 |
 | `--once` | 关闭 | 处理一批数据后退出 |
 
-默认等待时间为 60、120、240、300、300 秒。
+默认每次固定等待 3 秒，不递增。显式将 `--max-delay` 设为大于
+`--initial-delay` 时，才会启用指数退避。
 成功、其他类型的错误、手动中断或手动开始新任务会结束当前重试序列。
 达到上限后停止自动继续，直到开始新的手动回合。
 自动 `continue` 可能使 agent 在原会话权限下继续执行命令。
