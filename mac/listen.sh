@@ -82,7 +82,7 @@ send_notification() {
     "$message" < /dev/null > /dev/null
 }
 
-printf '%s\n' 'TCodex listener v5 (macOS native notifications).' >&2
+printf '%s\n' 'TCodex listener v6 (completion and question notifications).' >&2
 if [ "$test_notification" -eq 1 ]; then
   printf '%s\n' 'Local notification in 5 seconds. No SSH connection is needed.' >&2
   sleep 5
@@ -131,7 +131,7 @@ if [ -n "$port" ]; then
   ssh_options+=(-p "$port")
 fi
 ready_pattern=$'^READY\t([0-9]{1,18})$'
-event_pattern=$'^EVENT\t([0-9]{1,18})\t([0-9]{1,12})\t([0-9a-f]{12})$'
+event_pattern=$'^(EVENT|INPUT)\t([0-9]{1,18})\t([0-9]{1,12})\t([0-9a-f]{12})$'
 cursor=''
 delay=2
 printf 'Listening for TCodex channel %s. Ctrl+C stops only this listener.\n' "$channel" >&2
@@ -152,11 +152,17 @@ while :; do
       delay=2
       printf 'Notification stream connected (cursor %s).\n' "$cursor" >&2
     elif [[ "$line" =~ $event_pattern ]]; then
-      event_id="${BASH_REMATCH[1]}"
-      session="${BASH_REMATCH[3]}"
+      event_kind="${BASH_REMATCH[1]}"
+      event_id="${BASH_REMATCH[2]}"
+      session="${BASH_REMATCH[4]}"
       if [ -n "$cursor" ] && [ "$event_id" -gt "$cursor" ]; then
         printf 'Received event %s (session %s); notifying via osascript.\n' "$event_id" "$session" >&2
-        if ! send_notification "TCodex turn ended (session $session)"; then
+        if [ "$event_kind" = 'INPUT' ]; then
+          message="TCodex is preparing a question (session $session)"
+        else
+          message="TCodex turn ended (session $session)"
+        fi
+        if ! send_notification "$message"; then
           printf 'Notification command failed for event %s; keeping the listener connected.\n' "$event_id" >&2
         fi
         cursor="$event_id"

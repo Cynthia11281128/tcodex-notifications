@@ -120,17 +120,28 @@ class NotificationQueue:
             self.prune_files(now, files)
 
     def enqueue(self, payload, now=None):
-        if not isinstance(payload, dict) or payload.get("type") != "agent-turn-complete":
+        if not isinstance(payload, dict):
+            return False
+        kind = payload.get("type")
+        if kind not in ("agent-turn-complete", "user-input-requested"):
             return False
         thread = payload.get("thread-id")
         turn = payload.get("turn-id")
-        if not isinstance(thread, str) or not thread:
-            thread = uuid.uuid4().hex
-        session = hashlib.sha256(thread.encode("utf-8")).hexdigest()[:12]
-        if isinstance(turn, str) and turn:
+        if kind == "user-input-requested":
+            call = payload.get("tool-use-id")
+            if not all(isinstance(value, str) and 0 < len(value) <= 1024 for value in (thread, turn, call)):
+                return False
+            key = hashlib.sha256(json.dumps(
+                [kind, thread, turn, call], ensure_ascii=True, separators=(",", ":")
+            ).encode("utf-8")).hexdigest()
+        elif isinstance(thread, str) and thread and isinstance(turn, str) and turn:
+            # Preserve completion keys so upgrading does not replay existing events.
             key = hashlib.sha256((thread + "\0" + turn).encode("utf-8")).hexdigest()
         else:
             key = hashlib.sha256(uuid.uuid4().bytes).hexdigest()
+        if not isinstance(thread, str) or not thread:
+            thread = uuid.uuid4().hex
+        session = hashlib.sha256(thread.encode("utf-8")).hexdigest()[:12]
         now = int(time.time()) if now is None else now
         with self.locked(exclusive=True):
             files = self.event_files()
@@ -146,7 +157,10 @@ class NotificationQueue:
             if event_id > 999999999999999999:
                 raise ValueError("Notification sequence exhausted.")
             target = self.path / ("{:020d}-{:012d}-{}.json".format(event_id, now, key))
-            self.atomic_write(target, json.dumps([event_id, now, session]) + "\n")
+            row = [event_id, now, session]
+            if kind == "user-input-requested":
+                row.append(kind)
+            self.atomic_write(target, json.dumps(row) + "\n")
             return True
 
     def read_after(self, cursor, now=None):
@@ -162,7 +176,8 @@ class NotificationQueue:
                     row = json.loads(stream.read(1024))
                 if (
                     not isinstance(row, list)
-                    or len(row) != 3
+                    or len(row) not in (3, 4)
+                    or (len(row) == 4 and row[3] != "user-input-requested")
                     or type(row[0]) is not int
                     or row[0] != expected_id
                     or type(row[1]) is not int

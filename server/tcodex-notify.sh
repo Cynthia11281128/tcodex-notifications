@@ -21,9 +21,17 @@ if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", channel):
     sys.exit("Invalid TCODEX_NOTIFY_CHANNEL; use 1-64 letters, digits, underscores or hyphens.")
 print("notify=" + json.dumps([python, script, "--channel", channel], ensure_ascii=True))
 ' "$python_bin" "$script_dir/notify-event.py" "$channel")"
+input_hook_config="$("$python_bin" -c '
+import json, shlex, sys
+python, script, channel = sys.argv[1:]
+command = shlex.join([python, "-B", script, "--channel", channel])
+print("hooks.PreToolUse=[{matcher=\"^request_user_input$\",hooks=[{type=\"command\",command="
+      + json.dumps(command, ensure_ascii=True) + ",timeout=3}]}]")
+' "$python_bin" "$script_dir/notify-input.py" "$channel")"
 
-printf 'TCodex notification channel: %s. Keep the Mac listener connected.\n' "$channel" >&2
+printf 'TCodex notification channel: %s. Keep the Mac listener connected; review the question hook in /hooks on first use.\n' "$channel" >&2
 exec tcodex \
   -c 'tui.notifications=false' \
   -c "$notify_config" \
+  -c "$input_hook_config" \
   "$@"

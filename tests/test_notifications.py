@@ -7,6 +7,7 @@ import json
 import os
 import pty
 import select
+import shlex
 import shutil
 import subprocess
 import sys
@@ -37,6 +38,26 @@ def event(turn="turn-1", thread="thread-1"):
     }
 
 
+def input_hook(call="call-1"):
+    return {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "request_user_input",
+        "session_id": "thread-1",
+        "turn_id": "turn-1",
+        "tool_use_id": call,
+        "cwd": "/private/path",
+        "transcript_path": "/private/transcript",
+        "tool_input": {"questions": [{
+            "id": "question-1", "header": "Choice", "question": "SECRET_QUESTION",
+            "options": [
+                {"label": "A", "description": "SECRET_OPTION"},
+                {"label": "B", "description": "Another choice"},
+            ],
+        }]},
+        "tool_response": "SECRET_ANSWER",
+    }
+
+
 class NotificationsTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="notification-test-", dir=TMP)
@@ -52,11 +73,12 @@ class NotificationsTest(unittest.TestCase):
     def queue(self, channel="default"):
         return NotificationQueue(channel, self.runtime)
 
-    def python(self, script, *args):
+    def python(self, script, *args, stdin=None):
         return subprocess.run(
             [sys.executable, "-B", str(self.app / "server" / script), *args],
             capture_output=True,
             text=True,
+            input=stdin,
             timeout=10,
         )
 
@@ -182,6 +204,84 @@ class NotificationsTest(unittest.TestCase):
         self.assertEqual(self.python("notify-event.py", json.dumps(event("later"))).returncode, 0)
         self.assertEqual(self.python("notify-event.py", "--test").returncode, 1)
 
+    def test_input_hook_deduplicates_per_call_and_preserves_completion(self):
+        for call in ("call-1", "call-1", "call-2"):
+            result = self.python("notify-input.py", stdin=json.dumps(input_hook(call)))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "")
+        self.assertEqual(self.python("notify-event.py", json.dumps(event())).returncode, 0)
+        queue = self.queue()
+        try:
+            rows = queue.read_after(0)
+            self.assertEqual([len(row) for row in rows], [4, 4, 3])
+            self.assertEqual([row[3] for row in rows[:2]], ["user-input-requested"] * 2)
+            self.assertEqual(len({row[2] for row in rows}), 1)
+            self.assertFalse(queue.enqueue(event()))
+            data = b"".join(path.read_bytes() for path in queue.event_files())
+            for secret in (
+                b"SECRET_QUESTION", b"SECRET_OPTION", b"SECRET_ANSWER",
+                b"/private", b"thread-1", b"turn-1", b"call-1", b"question-1",
+            ):
+                self.assertNotIn(secret, data)
+        finally:
+            queue.close()
+
+    def test_input_hook_ignores_wrong_hooks_invalid_shapes_and_oversized_input(self):
+        invalid = [[], {}, input_hook(), input_hook(), input_hook(), input_hook(), input_hook()]
+        invalid[2]["hook_event_name"] = "PostToolUse"
+        invalid[3]["tool_name"] = "Bash"
+        invalid[4]["tool_use_id"] = ""
+        invalid[5]["tool_input"]["questions"] = []
+        invalid[6]["tool_input"]["questions"][0]["question"] = None
+        for payload in invalid:
+            with self.subTest(payload=payload):
+                result = self.python("notify-input.py", stdin=json.dumps(payload))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertFalse(self.runtime.exists())
+        result = self.python("notify-input.py", stdin="{SECRET_BAD_JSON")
+        self.assertEqual(result.returncode, 0)
+        self.assertNotIn("SECRET_BAD_JSON", result.stderr)
+        self.assertEqual(result.stdout, "")
+        result = self.python("notify-input.py", stdin=" " * (1024 * 1024 + 1))
+        self.assertEqual(result.returncode, 0)
+        self.assertFalse(self.runtime.exists())
+
+    def test_input_hook_runtime_failure_is_advisory_and_test_is_explicit(self):
+        self.assertEqual(self.python("notify-input.py", "--test").returncode, 0)
+        self.runtime.chmod(0o755)
+        result = self.python("notify-input.py", stdin=json.dumps(input_hook()))
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertNotIn("SECRET_", result.stderr)
+        self.assertEqual(self.python("notify-input.py", "--test").returncode, 1)
+
+    def test_queue_rejects_unknown_typed_records_and_keeps_legacy_records(self):
+        queue = self.queue()
+        try:
+            self.assertTrue(queue.enqueue(event()))
+            path = queue.event_files()[0]
+            legacy = json.loads(path.read_text())
+            self.assertEqual(queue.read_after(0), [tuple(legacy)])
+            queue.atomic_write(path, json.dumps(legacy + ["untrusted-kind"]))
+            with self.assertRaises(ValueError):
+                queue.read_after(0)
+            self.assertFalse(queue.enqueue({"type": "user-input-requested"}))
+        finally:
+            queue.close()
+
+    def test_stream_replays_mixed_event_types_in_sequence(self):
+        self.python("notify-event.py", json.dumps(event()))
+        self.python("notify-input.py", stdin=json.dumps(input_hook()))
+        self.python("notify-event.py", json.dumps(event("turn-2")))
+        replay = self.python("stream-events.py", "--once", "--after", "0")
+        self.assertEqual(replay.returncode, 0, replay.stderr)
+        lines = [line.split("\t") for line in replay.stdout.splitlines()]
+        self.assertEqual([line[0] for line in lines], ["READY", "EVENT", "INPUT", "EVENT"])
+        self.assertEqual([line[1] for line in lines], ["0", "1", "2", "3"])
+        initial = self.python("stream-events.py", "--once")
+        self.assertEqual(initial.stdout, "READY\t3\n")
+
     def test_stream_skips_initial_history_and_replays_after_cursor(self):
         self.python("notify-event.py", json.dumps(event()))
         initial = self.python("stream-events.py", "--once")
@@ -206,13 +306,18 @@ class NotificationsTest(unittest.TestCase):
             self.assertEqual(self.python("notify-event.py", "--test").returncode, 0)
             self.assertTrue(select.select([process.stdout], [], [], 5)[0])
             self.assertTrue(process.stdout.readline().startswith("EVENT\t1\t"))
+            self.assertEqual(
+                self.python("notify-input.py", stdin=json.dumps(input_hook())).returncode, 0
+            )
+            self.assertTrue(select.select([process.stdout], [], [], 5)[0])
+            self.assertTrue(process.stdout.readline().startswith("INPUT\t2\t"))
         finally:
             process.terminate()
             process.wait(timeout=5)
             process.stdout.close()
             process.stderr.close()
 
-    def test_launcher_passes_notify_command_without_running_codex(self):
+    def launcher_args(self):
         launcher = self.app / "server/tcodex-notify.sh"
         mock = (
             'tcodex() { printf "%s\\0" "$@"; return 23; }; '
@@ -228,8 +333,42 @@ class NotificationsTest(unittest.TestCase):
         self.assertEqual(args[:3], ["-c", "tui.notifications=false", "-c"])
         command = json.loads(args[3].removeprefix("notify="))
         self.assertEqual(command[1:], [str(self.app / "server/notify-event.py"), "--channel", "test-channel"])
-        self.assertEqual(args[4:], ["resume", "--last", "space in prompt"])
+        self.assertEqual(args[4], "-c")
+        self.assertTrue(args[5].startswith(
+            'hooks.PreToolUse=[{matcher="^request_user_input$",hooks=[{type="command",command='
+        ))
+        self.assertTrue(args[5].endswith(",timeout=3}]}]"))
+        command_json = args[5].split("command=", 1)[1].removesuffix(",timeout=3}]}]")
+        hook_command = shlex.split(json.loads(command_json))
+        self.assertEqual(hook_command[1:], [
+            "-B", str(self.app / "server/notify-input.py"), "--channel", "test-channel",
+        ])
+        self.assertEqual(args[6:], ["resume", "--last", "space in prompt"])
+        self.assertNotIn("--dangerously-bypass-hook-trust", args)
+        self.assertFalse(any(arg.startswith("features.") for arg in args))
         self.assertFalse(self.runtime.exists())
+        return hook_command
+
+    def test_launcher_passes_notify_and_hook_commands_without_running_codex(self):
+        self.launcher_args()
+
+    def test_launcher_quotes_hook_command_and_reads_stdin(self):
+        quoted = self.root / "a 'quoted path"
+        self.app.rename(quoted)
+        self.app = quoted
+        self.runtime = quoted / "runtime"
+        command = self.launcher_args()
+        result = subprocess.run(
+            shlex.join(command), shell=True, input=json.dumps(input_hook()),
+            capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+        queue = self.queue("test-channel")
+        try:
+            self.assertEqual(queue.read_after(0)[0][3], "user-input-requested")
+        finally:
+            queue.close()
 
     def run_listener(self, fake_ssh, *args, timeout=8, shell_setup=""):
         master, slave = pty.openpty()
@@ -284,7 +423,7 @@ class NotificationsTest(unittest.TestCase):
         )
         self.assertEqual(code, 0, stderr)
         self.assertEqual(output, b"")
-        self.assertIn("TCodex listener v5 (macOS native notifications)", stderr)
+        self.assertIn("TCodex listener v6 (completion and question notifications)", stderr)
         self.assertIn("NATIVE_ARGUMENT:on run argv", stderr)
         self.assertIn('NATIVE_ARGUMENT:display notification (item 1 of argv) with title "TCodex" sound name "Glass"', stderr)
         self.assertIn("NATIVE_ARGUMENT:TCodex local notification test", stderr)
@@ -341,6 +480,39 @@ class NotificationsTest(unittest.TestCase):
         self.assertEqual(stderr.count("Notification command failed for event "), 2)
         self.assertEqual(stderr.count("Received event "), 2)
         self.assertEqual(list(self.runtime.glob("listener.*")), [])
+
+    def test_listener_distinguishes_questions_and_completion_and_filters_duplicates(self):
+        fake = (
+            "ssh() { printf 'READY\\t0\\n"
+            "INPUT\\t1\\t12345\\t0123456789ab\\n"
+            "INPUT\\t1\\t12345\\t0123456789ab\\n"
+            "INPUT\\t2\\t12345\\tSECRET_SESSION\\n"
+            "EVENT\\t2\\t12345\\t0123456789ab\\n'; }"
+        )
+        code, output, stderr = self.run_listener(fake, "--once", "server")
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(output, b"")
+        self.assertEqual(stderr.count("NATIVE_ARGUMENT:TCodex is preparing a question"), 1)
+        self.assertEqual(stderr.count("NATIVE_ARGUMENT:TCodex turn ended"), 1)
+        self.assertNotIn("SECRET_SESSION", stderr)
+        self.assertEqual(stderr.count("Received event "), 2)
+
+    def test_listener_reconnects_after_question_cursor(self):
+        fake = (
+            "ssh() { command=\"${@: -1}\"; "
+            "case \"$command\" in "
+            "*'--after 1'*) printf 'READY\\t1\\nINPUT\\t1\\t123\\t0123456789ab\\n"
+            "EVENT\\t2\\t123\\t0123456789ab\\n'; "
+            "sleep 0.1; kill -TERM \"$$\";; "
+            "*) printf 'READY\\t0\\nINPUT\\t1\\t123\\t0123456789ab\\n'; return 255;; "
+            "esac; }"
+        )
+        code, output, stderr = self.run_listener(fake, "server")
+        self.assertEqual(code, 143, stderr)
+        self.assertEqual(output, b"")
+        self.assertEqual(stderr.count("NATIVE_ARGUMENT:TCodex is preparing a question"), 1)
+        self.assertEqual(stderr.count("NATIVE_ARGUMENT:TCodex turn ended"), 1)
+        self.assertIn("retrying", stderr)
 
     def test_native_local_notification_failure_is_explicit(self):
         setup = (

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SSH stdout protocol: READY <cursor>, then EVENT <id> <time> <session>."""
+"""SSH stdout protocol: READY <cursor>, then EVENT or INPUT <id> <time> <session>."""
 
 import argparse
 import sys
@@ -26,8 +26,10 @@ def main():
         print("READY\t{}".format(cursor), flush=True)
         last_prune = time.monotonic()
         while True:
-            for event_id, created, session in queue.read_after(cursor):
-                print("EVENT\t{}\t{}\t{}".format(event_id, created, session), flush=True)
+            for row in queue.read_after(cursor):
+                event_id, created, session = row[:3]
+                kind = "INPUT" if len(row) == 4 else "EVENT"
+                print("{}\t{}\t{}\t{}".format(kind, event_id, created, session), flush=True)
                 cursor = event_id
             if args.once:
                 return 0

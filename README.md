@@ -1,13 +1,15 @@
 # tcodex-notification
 
-服务器运行 TCodex，Mac 通过 SSH 接收回合结束事件并显示原生通知。
+服务器运行 TCodex，Mac 通过 SSH 接收回合结束、准备提问事件并显示原生通知。
 另有独立启动的服务器 watcher，在最终 HTTP 429 重试耗尽后向同一会话发送 `continue`。
 两项功能独立运行，无需额外通知应用，不修改 TCodex 的安装或默认配置。
 
 ## 架构
 
 ```text
-TCodex → notify hook → 服务器事件队列 → SSH → Mac osascript → 系统通知
+TCodex → notify 完成回调                    \
+                                             → 服务器事件队列 → SSH → Mac osascript
+TCodex → PreToolUse(request_user_input) hook /
 会话 JSONL → 服务器 watcher → 退避等待 → 同一活跃会话收到 continue
 ```
 
@@ -18,6 +20,7 @@ TCodex → notify hook → 服务器事件队列 → SSH → Mac osascript → �
 server/
   tcodex-notify.sh       TCodex 启动入口
   notify-event.py        完成事件与测试入口
+  notify-input.py        提问 hook 与测试入口
   notify_queue.py        队列、去重和保留限制
   stream-events.py       SSH 事件流
   watch-retries.py       独立启动的 429 自动继续 watcher
@@ -54,7 +57,7 @@ bash ~/Developer/tcodex-notification/mac/listen.sh --test-notification
 
 确认 Mac 允许对应来源的通知，专注模式没有屏蔽提醒。
 
-## 完成通知
+## 完成与提问通知
 
 **1. Mac 本地启动监听**，等待 `Notification stream connected`，保持窗口开启：
 
@@ -81,12 +84,47 @@ bash /absolute/path/to/tcodex-notification/server/tcodex-notify.sh
 在需要处理的项目目录中执行上述命令，然后正常提交任务。附加参数直接追加，例如 `resume`。
 直接运行 `tcodex` 或已运行的会话不会自动接入通知。
 
+**4. 首次启用提问 hook 时，在 TCodex 内打开 `/hooks`**，检查并信任
+匹配 `^request_user_input$`、执行本仓库 `server/notify-input.py --channel ...` 的 command hook。
+启动脚本只注入当前会话配置，不修改共享配置，也不绕过 hook 信任检查。
+更换脚本路径、Python 路径、channel 或 hook 定义后，可能需要重新审核。
+未信任、被禁用或被管理策略禁止时，提问提醒不会执行，原有完成通知仍独立运行。
+
 默认 channel 为 `default`。自定义时，服务器设置 `TCODEX_NOTIFY_CHANNEL`，Mac 使用同名 `--channel`。
 Mac 也可用 `TCODEX_NOTIFY_SERVER_DIR` 环境变量代替 `--server-dir`，配置示例见 `.env.example`。
 没有 SSH 别名时使用 `user@host`，自定义端口用监听参数 `--port`。
 
-在 Mac 按 `Ctrl+C` 仅停止监听，不停止服务器任务。Mac 需在线且未休眠；通知表示回合结束，不代表任务成功。
+在 Mac 按 `Ctrl+C` 仅停止监听，不停止服务器任务。Mac 需在线且未休眠；完成通知表示回合结束，不代表任务成功。
 首次启动跳过旧事件，运行时断线自动重连。不要在运行期间删除 `runtime/` 的锁和游标。
+
+### 提问提醒与升级
+
+已在 Codex 0.154.0 runtime 验证 `PreToolUse` 匹配 `request_user_input`。
+此 hook 在工具执行前发出一次提醒，因此通知文案为 `TCodex is preparing a question`。
+它表示“准备提问”，不保证通知到达时仍在等待回答：工具不可用、参数无效、
+其他 hook 拦截、手动中断或已经回答，都可能使提醒与当前界面不一致。
+仅覆盖结构化 `request_user_input`，不覆盖普通聊天中的问句、命令权限审批或其他输入形式。
+启动脚本不改变 Plan/Default 模式，不额外开启 Default 模式提问功能。
+
+同一调用按 session、turn、tool-call 标识去重；同一回合的不同调用分别提醒。
+一个调用包含多道问题时仍只提醒一次。问题、选项、答案与工作目录不会写入通知队列，
+Mac 只收到事件编号、时间、会话标识的短哈希，以及由协议行类型区分的事件类别。
+hook 不返回许可决定，不修改工具参数，不代答；正常回调失败不会阻止 TCodex。
+hook 配置超时为 3 秒，极端队列竞争时可能丢失提醒。
+
+升级时重新下载 `mac/listen.sh`，停止旧监听器并重启，确认日志显示 `TCodex listener v6`。
+新监听器兼容旧完成事件；旧监听器会忽略新的 `INPUT` 事件，不会将提问误报为完成。
+服务器需要通过更新后的启动脚本新建或 `resume` 会话，已运行会话不会自动添加 hook。
+SSH 重连仍会补发未读事件，可能补发已经回答的提问提醒；重启监听器则跳过历史。
+
+Mac 监听连接成功后，可在服务器测试提问提醒的完整通知链路：
+
+```bash
+python3 -B server/notify-input.py --channel default --test
+```
+
+这里的 `--test` 直接写入合成事件，不验证 TCodex 是否加载或信任 hook。
+使用自定义 channel 时替换 `--channel default`，并保持与 Mac 一致。
 
 ## 429 自动继续
 
