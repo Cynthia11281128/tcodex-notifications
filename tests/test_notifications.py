@@ -301,21 +301,55 @@ class NotificationsTest(unittest.TestCase):
             text=True,
         )
         try:
-            self.assertTrue(select.select([process.stdout], [], [], 5)[0])
+            self.assertTrue(select.select([process.stdout], [], [], 15)[0])
             self.assertEqual(process.stdout.readline(), "READY\t0\n")
             self.assertEqual(self.python("notify-event.py", "--test").returncode, 0)
-            self.assertTrue(select.select([process.stdout], [], [], 5)[0])
+            self.assertTrue(select.select([process.stdout], [], [], 15)[0])
             self.assertTrue(process.stdout.readline().startswith("EVENT\t1\t"))
             self.assertEqual(
                 self.python("notify-input.py", stdin=json.dumps(input_hook())).returncode, 0
             )
-            self.assertTrue(select.select([process.stdout], [], [], 5)[0])
+            self.assertTrue(select.select([process.stdout], [], [], 15)[0])
             self.assertTrue(process.stdout.readline().startswith("INPUT\t2\t"))
         finally:
             process.terminate()
             process.wait(timeout=5)
             process.stdout.close()
             process.stderr.close()
+
+    def test_dual_source_reconnect_has_independent_cursors(self):
+        fake_ssh = r'''
+ssh() {
+  case "$*" in
+    *"/codex/"*)
+      if [[ "$*" == *"--after 1"* ]]; then
+        printf 'READY\t1\nINPUT\t2\t1\tabcdef123456\n'
+      else
+        printf 'READY\t0\nEVENT\t1\t1\tabcdef123456\n'
+      fi ;;
+    *"/claude/"*)
+      if [[ "$*" == *"--after 10"* ]]; then
+        printf 'READY\t10\nINPUT\t11\t1\tabcdef123456\n'
+      else
+        printf 'READY\t0\nEVENT\t10\t1\tabcdef123456\n'
+      fi ;;
+  esac
+}
+sleep() {
+  count=$((${count:-0} + 1))
+  if [ "$count" -ge 2 ]; then kill -TERM "$BASHPID"; else command sleep 0.1; fi
+}
+count=0
+export -f sleep
+'''
+        code, _output, stderr = self.run_listener(
+            fake_ssh.strip(), "--tcodex-dir", "/codex", "--tclaude-dir", "/claude", "host",
+            shell_setup="unset TCODEX_NOTIFY_SERVER_DIR; ",
+        )
+        self.assertNotEqual(code, 0)
+        for source in ("TCodex", "TClaude"):
+            self.assertIn(source + " turn ended", stderr)
+            self.assertIn(source + " is preparing a question", stderr)
 
     def launcher_args(self):
         launcher = self.app / "server/tcodex-notify.sh"

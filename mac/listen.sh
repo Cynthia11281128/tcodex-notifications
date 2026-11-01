@@ -4,6 +4,7 @@ set -eu
 usage() {
   printf '%s\n' \
     'Usage: bash listen.sh --server-dir PATH [--port PORT] [--channel NAME] [--once] SSH_DEST' \
+    '       bash listen.sh [--tcodex-dir PATH] [--tclaude-dir PATH] [--port PORT] [--channel NAME] SSH_DEST' \
     '       bash listen.sh --test-notification' \
     'Run locally on the Mac, not inside a server SSH session. Notifications use osascript.' \
     'Existing --notifier osascript commands remain supported.' \
@@ -12,6 +13,10 @@ usage() {
 }
 
 server_dir="${TCODEX_NOTIFY_SERVER_DIR:-}"
+tcodex_dir="${TCODEX_NOTIFY_TCODEX_DIR:-}"
+tclaude_dir="${TCODEX_NOTIFY_TCLAUDE_DIR:-}"
+source_name="${TCODEX_LISTENER_SOURCE:-TCodex}"
+case "$source_name" in TCodex|TClaude) ;; *) exit 2 ;; esac
 channel="${TCODEX_NOTIFY_CHANNEL:-default}"
 destination=''
 port=''
@@ -20,12 +25,14 @@ test_notification=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --help|-h) usage; exit 0 ;;
-    --port|--channel|--server-dir|--notifier)
+    --port|--channel|--server-dir|--tcodex-dir|--tclaude-dir|--notifier)
       [ "$#" -ge 2 ] || { usage >&2; exit 2; }
       case "$1" in
         --port) port="$2" ;;
         --channel) channel="$2" ;;
         --server-dir) server_dir="$2" ;;
+        --tcodex-dir) tcodex_dir="$2" ;;
+        --tclaude-dir) tclaude_dir="$2" ;;
         --notifier)
           [ "$2" = 'osascript' ] || {
             printf '%s\n' 'Only osascript notifications are supported.' >&2
@@ -42,6 +49,52 @@ while [ "$#" -gt 0 ]; do
       destination="$1"; shift ;;
   esac
 done
+if [ -n "$tcodex_dir" ] || [ -n "$tclaude_dir" ]; then
+  [ -z "$server_dir" ] && [ "$test_notification" -eq 0 ] || {
+    printf '%s\n' 'Do not mix --server-dir or --test-notification with source directories.' >&2
+    exit 2
+  }
+  [ -n "$destination" ] || { usage >&2; exit 2; }
+  for directory in "$tcodex_dir" "$tclaude_dir"; do
+    case "$directory" in ''|/*) ;; *) printf '%s\n' 'Source directories must be absolute.' >&2; exit 2 ;; esac
+  done
+  [[ "$channel" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]] || exit 2
+  if [ -n "$port" ]; then
+    [[ "$port" =~ ^[0-9]{1,5}$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || exit 2
+  fi
+  [ -z "${SSH_CONNECTION:-}${SSH_TTY:-}" ] || {
+    printf '%s\n' 'This listener must run on the Mac, not inside a server SSH session.' >&2; exit 2;
+  }
+  command -v osascript >/dev/null 2>&1 || {
+    printf '%s\n' 'osascript is unavailable. Run this listener locally on the Mac.' >&2; exit 2;
+  }
+  listener_script="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/$(basename -- "${BASH_SOURCE[0]}")"
+  child_options=(--channel "$channel")
+  [ -z "$port" ] || child_options+=(--port "$port")
+  [ "$once" -eq 0 ] || child_options+=(--once)
+  children=()
+  stop_children() {
+    for pid in "${children[@]}"; do kill "$pid" 2>/dev/null || :; done
+    for pid in "${children[@]}"; do wait "$pid" 2>/dev/null || :; done
+  }
+  trap stop_children EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  printf '%s\n' 'Unified listener v7 (independent TCodex and TClaude streams).' >&2
+  for source_name in TCodex TClaude; do
+    if [ "$source_name" = TCodex ]; then directory="$tcodex_dir"; else directory="$tclaude_dir"; fi
+    [ -n "$directory" ] || continue
+    (
+      unset TCODEX_NOTIFY_TCODEX_DIR TCODEX_NOTIFY_TCLAUDE_DIR TCODEX_NOTIFY_SERVER_DIR
+      export TCODEX_LISTENER_SOURCE="$source_name"
+      exec bash "$listener_script" --server-dir "$directory" "${child_options[@]}" "$destination"
+    ) &
+    children+=("$!")
+  done
+  status=0
+  for pid in "${children[@]}"; do wait "$pid" || status=$?; done
+  exit "$status"
+fi
 if [ "$test_notification" -eq 0 ] && [ -z "$destination" ]; then
   usage >&2
   exit 2
@@ -75,6 +128,14 @@ command -v osascript >/dev/null 2>&1 || {
 send_notification() {
   local message="$1"
   # Keep message data out of AppleScript source and event-stream stdin.
+  if [ "$source_name" = TClaude ]; then
+    osascript \
+      -e 'on run argv' \
+      -e 'display notification (item 1 of argv) with title (item 2 of argv) sound name "Glass"' \
+      -e 'end run' \
+      "$message" "$source_name" < /dev/null > /dev/null
+    return
+  fi
   osascript \
     -e 'on run argv' \
     -e 'display notification (item 1 of argv) with title "TCodex" sound name "Glass"' \
@@ -82,7 +143,7 @@ send_notification() {
     "$message" < /dev/null > /dev/null
 }
 
-printf '%s\n' 'TCodex listener v6 (completion and question notifications).' >&2
+printf '%s listener v6 (completion and question notifications).\n' "$source_name" >&2
 if [ "$test_notification" -eq 1 ]; then
   printf '%s\n' 'Local notification in 5 seconds. No SSH connection is needed.' >&2
   sleep 5
@@ -134,7 +195,7 @@ ready_pattern=$'^READY\t([0-9]{1,18})$'
 event_pattern=$'^(EVENT|INPUT)\t([0-9]{1,18})\t([0-9]{1,12})\t([0-9a-f]{12})$'
 cursor=''
 delay=2
-printf 'Listening for TCodex channel %s. Ctrl+C stops only this listener.\n' "$channel" >&2
+printf 'Listening for %s channel %s. Ctrl+C stops only this listener.\n' "$source_name" "$channel" >&2
 while :; do
   remote_command="python3 -B $(shell_quote "$server_dir/server/stream-events.py") --channel $(shell_quote "$channel")"
   if [ -n "$cursor" ]; then
@@ -150,7 +211,7 @@ while :; do
     if [[ "$line" =~ $ready_pattern ]]; then
       cursor="${BASH_REMATCH[1]}"
       delay=2
-      printf 'Notification stream connected (cursor %s).\n' "$cursor" >&2
+      printf 'Notification stream connected (cursor %s). Source: %s.\n' "$cursor" "$source_name" >&2
     elif [[ "$line" =~ $event_pattern ]]; then
       event_kind="${BASH_REMATCH[1]}"
       event_id="${BASH_REMATCH[2]}"
@@ -158,9 +219,9 @@ while :; do
       if [ -n "$cursor" ] && [ "$event_id" -gt "$cursor" ]; then
         printf 'Received event %s (session %s); notifying via osascript.\n' "$event_id" "$session" >&2
         if [ "$event_kind" = 'INPUT' ]; then
-          message="TCodex is preparing a question (session $session)"
+          message="$source_name is preparing a question (session $session)"
         else
-          message="TCodex turn ended (session $session)"
+          message="$source_name turn ended (session $session)"
         fi
         if ! send_notification "$message"; then
           printf 'Notification command failed for event %s; keeping the listener connected.\n' "$event_id" >&2

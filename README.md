@@ -1,5 +1,94 @@
 # tcodex-notification
 
+## TClaude 分支：统一 Mac 监听
+
+本分支保留 TCodex 功能，并增加 TClaude 通知及独立的原生 hook 自动继续。
+`main` 和本分支的 `mac/listen.sh` 内容一致，从任一位置下载新版均可。
+两端需要使用相同 channel；目录参数显式指定事件来源，不会自动搜索其他目录。
+
+Mac 更新脚本后，只运行一个命令：
+
+```bash
+bash ~/Developer/tcodex-notification/mac/listen.sh \
+  --tcodex-dir /absolute/path/to/tcodex-notification \
+  --tclaude-dir /absolute/path/to/tclaude-notification \
+  --channel default server-alias
+```
+
+该命令管理两条独立 SSH 流；游标、重连和去重分别处理，一边断线不影响另一边。
+通知标题分别为 TCodex 和 TClaude。只传一个目录参数即可单独监听。
+旧 `--server-dir` 保留为 TCodex 单来源用法，不能与新目录参数混用。
+新目录参数也可通过 `.env.example` 中的环境变量设置，命令行覆盖对应环境变量。
+双来源入口显示 `Unified listener v7`；兼容子监听器保留 v6 标识。
+
+### 服务器启动 TClaude
+
+```bash
+TCLAUDE_NOTIFY_CHANNEL=default \
+  bash /absolute/path/to/tclaude-notification/server/tclaude-notify.sh
+```
+
+在目标项目工作目录执行。所有附加参数传给 TClaude，例如 `--resume SESSION_UUID`。
+启动入口只注入当前进程的 `--settings`，不修改共享配置、不改变模型或权限；
+用户显式指定关闭 hooks 的模式会使通知和自动继续不可用。本入口拒绝附加
+`--settings`，额外配置使用正常 user/project settings。首次使用检查 `/hooks` 和工作目录信任。
+已经运行的 TClaude 不会自动接入；TCodex 原启动入口和队列保持不变。
+
+`Stop` 和 `StopFailure` 表示回合结束，不表示成功；`AskUserQuestion` 的
+`PreToolUse` 表示准备提问，不保证仍在等待回答。不处理审批提醒或子代理事件。
+队列只保存编号、时间和 session 短哈希，不保存问题、选项、回答或错误内容。
+
+完整链路的合成测试（需先连接 Mac）：
+
+```bash
+python3 -B server/tclaude-events.py --channel default --test complete
+python3 -B server/tclaude-events.py --channel default --test input
+```
+
+### 独立 TClaude watcher
+
+```bash
+python3 -B server/watch-tclaude-retries.py --all-registered
+python3 -B server/watch-tclaude-retries.py --session SESSION_UUID
+python3 -B server/watch-tclaude-retries.py --all-registered --dry-run
+```
+
+先启动 watcher，再让通过本入口接入的 TClaude 执行任务。可以监督接入后已有及
+未来活跃主会话；未加载 hook 的旧会话、headless、subagent 不在范围内。
+watcher 不依赖 Mac，通知入口不自动启动 watcher。停止 watcher 不停止 TClaude。
+`--once` 仅检查注册会话后退出，不等待未来失败。
+
+默认固定等待 3 秒，连续最多 5 次，观察超时 30 秒；`--initial-delay`、
+`--max-delay`、`--max-retries`、`--observe-timeout` 可配置。较大的 max-delay
+启用指数退避。延迟及观察时间最大 300 秒，次数最大 100。
+自定义 `--runtime-dir` 必须与会话环境 `TCLAUDE_NOTIFICATION_RUNTIME` 一致；
+自定义 `--tmp-dir` 必须与会话 TMPDIR 一致，禁止 `/tmp`。
+状态默认位于 `runtime/.tclaude-auto-continue`，socket 位于 workspace `tmp`，
+dry-run 检查点单独保存，不消耗正式次数。
+
+仅当最终 `StopFailure(error=rate_limit)` 对应 transcript 中最新 assistant
+记录具有 `isApiErrorMessage=true`、整数 `apiErrorStatus=429` 时考虑重试。
+watcher 检查同用户活跃 TUI 进程、失败记录和当前 prompt，持久化批准后通知
+该失败回调通过 `asyncRewake` 唤醒原会话。送入的是固定 hook 反馈，不是新建
+用户消息 `continue`；原上下文、模型和权限保留。手动提交、成功、其他错误或
+退出取消待处理失败。批准不确定或观察超时停止序列，不重放；新的手动输入重新启用。
+检查与 native wake 不是原子操作，最后的检查仍可能与手动输入竞争；不要在频繁改向的
+会话中无人值守使用。已批准并进入 runtime 的唤醒无法通过停止 watcher 撤回。
+runtime 内部格式和 asyncRewake 属于版本相关接口，升级后需重新验证。
+本机已通过 Claude Code `2.1.295` 的隔离 PTY、本地模拟 429 和连续唤醒测试。
+自动继续只接受可执行文件位于 `claude-code-2.1.295` 目录的 runtime；
+其他版本拒绝自动继续，但通知不受此限制。测试不使用真实凭据或模型服务。
+
+新增测试：
+
+```bash
+python3 -B tests/test_tclaude_notifications.py
+python3 -B tests/test_tclaude_watch.py
+# Optional: explicitly select the verified native binary, never the gateway wrapper.
+TCLAUDE_TEST_RUNTIME=/absolute/path/to/claude-code-2.1.295/claude \
+  python3 -B tests/test_tclaude_runtime.py
+```
+
 服务器运行 TCodex，Mac 通过 SSH 接收回合结束、准备提问事件并显示原生通知。
 另有独立启动的服务器 watcher，在最终 HTTP 429 重试耗尽后向同一会话发送 `continue`。
 两项功能独立运行，无需额外通知应用，不修改 TCodex 的安装或默认配置。
