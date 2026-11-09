@@ -1,6 +1,7 @@
 """Run from the repository root with python3 -B tests/test_notifications.py."""
 
 import concurrent.futures
+from contextlib import closing
 import hashlib
 import importlib.util
 import json
@@ -9,6 +10,7 @@ import pty
 import select
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -66,6 +68,12 @@ class NotificationsTest(unittest.TestCase):
         shutil.copytree(PROJECT / "server", self.app / "server")
         shutil.copytree(PROJECT / "mac", self.app / "mac")
         self.runtime = self.app / "runtime"
+        self.codex_home = self.root / "codex-home"
+        self.codex_home.mkdir()
+        self.state = self.codex_home / "state_5.sqlite"
+        with closing(sqlite3.connect(self.state)) as conn, conn:
+            conn.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, source TEXT NOT NULL)")
+            conn.execute("INSERT INTO threads VALUES (?, ?)", ("thread-1", "cli"))
 
     def tearDown(self):
         self.temp.cleanup()
@@ -73,13 +81,14 @@ class NotificationsTest(unittest.TestCase):
     def queue(self, channel="default"):
         return NotificationQueue(channel, self.runtime)
 
-    def python(self, script, *args, stdin=None):
+    def python(self, script, *args, stdin=None, env=None):
         return subprocess.run(
             [sys.executable, "-B", str(self.app / "server" / script), *args],
             capture_output=True,
             text=True,
             input=stdin,
             timeout=10,
+            env={**os.environ, "CODEX_HOME": str(self.codex_home), **(env or {})},
         )
 
     def test_queue_deduplicates_and_stores_no_private_payload(self):
@@ -203,6 +212,157 @@ class NotificationsTest(unittest.TestCase):
         self.runtime.chmod(0o755)
         self.assertEqual(self.python("notify-event.py", json.dumps(event("later"))).returncode, 0)
         self.assertEqual(self.python("notify-event.py", "--test").returncode, 1)
+
+    def test_completion_allows_primary_cli_and_deduplicates_without_text_filtering(self):
+        payload = event()
+        payload["input-messages"] = ["Generate a concise, single-line task title"]
+        before = self.state.read_bytes()
+        for _ in range(2):
+            result = self.python("notify-event.py", json.dumps(payload))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout + result.stderr, "")
+        queue = self.queue()
+        try:
+            self.assertEqual(len(queue.read_after(0)), 1)
+        finally:
+            queue.close()
+        self.assertEqual(self.state.read_bytes(), before)
+
+    def test_completion_ignores_ephemeral_title_and_recap_tasks(self):
+        for thread, prompt in (
+            ("title-thread", "Generate a concise, single-line task title"),
+            ("recap-thread", "Write a brief catch-up for a user returning to this Codex task"),
+        ):
+            with self.subTest(thread=thread):
+                payload = event(thread=thread)
+                payload["input-messages"] = [prompt]
+                result = self.python("notify-event.py", json.dumps(payload))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout + result.stderr, "")
+                self.assertFalse(self.runtime.exists())
+
+    def test_completion_ignores_registered_non_cli_sources(self):
+        for source in (
+            "exec", "vscode", '{"subagent":"review"}',
+            '{"subagent":{"thread_spawn":{"parent_thread_id":"thread-1","depth":1}}}',
+        ):
+            with self.subTest(source=source):
+                with closing(sqlite3.connect(self.state)) as conn, conn:
+                    conn.execute("UPDATE threads SET source=?", (source,))
+                result = self.python("notify-event.py", json.dumps(event()))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout + result.stderr, "")
+                self.assertFalse(self.runtime.exists())
+
+    def test_completion_uses_selected_codex_home_and_parameterized_identifiers(self):
+        other = self.root / "a 'quoted codex home"
+        other.mkdir()
+        with closing(sqlite3.connect(other / "state_5.sqlite")) as conn, conn:
+            conn.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, source TEXT)")
+        result = self.python(
+            "notify-event.py", json.dumps(event()), env={"CODEX_HOME": str(other)}
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.runtime.exists())
+        result = self.python("notify-event.py", json.dumps(event(thread="' OR 1=1 --")))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.runtime.exists())
+        home = self.root / "alternate-home"
+        home.mkdir()
+        (home / ".tcodex").symlink_to(self.codex_home, target_is_directory=True)
+        result = self.python(
+            "notify-event.py", json.dumps(event()), env={"CODEX_HOME": "", "HOME": str(home)}
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        queue = self.queue()
+        try:
+            self.assertEqual(len(queue.read_after(0)), 1)
+        finally:
+            queue.close()
+
+    def test_completion_rejects_missing_or_invalid_identifiers(self):
+        for field in ("thread-id", "turn-id"):
+            for value in (None, "", 123, "x" * 1025):
+                with self.subTest(field=field, value=value):
+                    payload = event()
+                    payload[field] = value
+                    result = self.python("notify-event.py", json.dumps(payload))
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout + result.stderr, "")
+                    self.assertFalse(self.runtime.exists())
+
+    def test_completion_unavailable_state_is_nonfatal_and_test_bypasses_filter(self):
+        for failure in ("missing", "corrupt", "schema"):
+            with self.subTest(failure=failure):
+                self.state.unlink()
+                if failure == "corrupt":
+                    self.state.write_text("SECRET_CORRUPT_DATABASE")
+                elif failure == "schema":
+                    with closing(sqlite3.connect(self.state)) as conn, conn:
+                        conn.execute("CREATE TABLE threads (id TEXT PRIMARY KEY)")
+                result = self.python("notify-event.py", json.dumps(event()))
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("CODEX_HOME/state_5.sqlite", result.stderr)
+                self.assertNotIn("SECRET_", result.stderr)
+                self.assertFalse(self.runtime.exists())
+                if failure == "missing":
+                    self.assertFalse(self.state.exists())
+                    self.state.touch()
+        self.assertEqual(self.python("notify-event.py", "--test").returncode, 0)
+        queue = self.queue()
+        try:
+            self.assertEqual(len(queue.read_after(0)), 1)
+        finally:
+            queue.close()
+
+    def test_completion_retries_transient_database_lock(self):
+        conn = sqlite3.connect(self.state)
+        conn.execute("BEGIN EXCLUSIVE")
+        process = subprocess.Popen(
+            [sys.executable, "-B", str(self.app / "server/notify-event.py"), json.dumps(event())],
+            env={**os.environ, "CODEX_HOME": str(self.codex_home)},
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            time.sleep(0.4)
+            conn.rollback()
+            stdout, stderr = process.communicate(timeout=5)
+            self.assertEqual(process.returncode, 0, stderr)
+            self.assertEqual(stdout + stderr, "")
+            queue = self.queue()
+            try:
+                self.assertEqual(len(queue.read_after(0)), 1)
+            finally:
+                queue.close()
+        finally:
+            conn.close()
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
+
+    def test_completion_persistent_database_lock_does_not_notify(self):
+        with closing(sqlite3.connect(self.state)) as conn, conn:
+            conn.execute("BEGIN EXCLUSIVE")
+            result = self.python("notify-event.py", json.dumps(event()))
+            conn.rollback()
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("CODEX_HOME/state_5.sqlite", result.stderr)
+        self.assertFalse(self.runtime.exists())
+
+    def test_completion_reads_registered_cli_from_wal(self):
+        with closing(sqlite3.connect(self.state)) as conn, conn:
+            self.assertEqual(conn.execute("PRAGMA journal_mode=WAL").fetchone()[0], "wal")
+            conn.execute("INSERT INTO threads VALUES (?, ?)", ("wal-thread", "cli"))
+            conn.commit()
+            result = self.python("notify-event.py", json.dumps(event(thread="wal-thread")))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout + result.stderr, "")
+        queue = self.queue()
+        try:
+            self.assertEqual(len(queue.read_after(0)), 1)
+        finally:
+            queue.close()
 
     def test_input_hook_deduplicates_per_call_and_preserves_completion(self):
         for call in ("call-1", "call-1", "call-2"):
